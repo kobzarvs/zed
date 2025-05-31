@@ -754,7 +754,9 @@ impl ProjectSearchView {
         }));
 
         let query_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
+            let mut editor = Editor::auto_height(100, window, cx);
+            // TODO: Verify soft_wrap behavior and if any explicit settings are needed
+            // for optimal multi-line input field experience.
             editor.set_placeholder_text("Search all files…", cx);
             editor.set_text(query_text, window, cx);
             editor
@@ -1944,7 +1946,6 @@ impl Render for ProjectSearchBar {
                     BaseStyle::SingleInput => div.w(input_width),
                     BaseStyle::MultipleInputs => div.flex_grow(),
                 })
-                .h_8()
                 .pl_2()
                 .pr_1()
                 .py_1()
@@ -1955,13 +1956,17 @@ impl Render for ProjectSearchBar {
 
         let query_column = input_base_styles(BaseStyle::SingleInput)
             .on_action(cx.listener(|this, action, window, cx| this.confirm(action, window, cx)))
-            .on_action(cx.listener(|this, action, window, cx| {
-                this.previous_history_query(action, window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, action, window, cx| this.next_history_query(action, window, cx)),
+            // .on_action(cx.listener(|this, action: &PreviousHistoryQuery, window, cx| {
+            //     this.previous_history_query(action, window, cx)
+            // }))
+            // .on_action(
+            //     cx.listener(|this, action: &NextHistoryQuery, window, cx| this.next_history_query(action, window, cx)),
+            // )
+            .child(
+                div()
+                    .flex_grow()
+                    .child(self.render_text_input(&search.query_editor, cx)),
             )
-            .child(self.render_text_input(&search.query_editor, cx))
             .child(
                 h_flex()
                     .gap_1()
