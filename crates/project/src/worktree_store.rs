@@ -5,7 +5,8 @@ use std::{
     sync::{Arc, atomic::AtomicUsize},
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{anyhow, Context as _, Result};
+use gpui::Global;
 use collections::{HashMap, HashSet};
 use fs::Fs;
 use futures::{
@@ -61,7 +62,8 @@ pub struct WorktreeStore {
     state: WorktreeStoreState,
 }
 
-#[derive(Debug)]
+impl Global for WorktreeStore {}
+
 pub enum WorktreeStoreEvent {
     WorktreeAdded(Entity<Worktree>),
     WorktreeRemoved(EntityId, WorktreeId),

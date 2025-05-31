@@ -1,5 +1,7 @@
 use anyhow::Context as _;
-use collections::HashMap;
+use std::collections::HashMap;
+// use collections::FxHashMap; // Changed to std::collections::HashMap for ContextServerCommand::env
+// use worktree::Worktree; // Removed duplicate: For $ZED_WORKTREE_ROOT substitution. Imported in line 32.
 use context_server::ContextServerCommand;
 use dap::adapters::DebugAdapterName;
 use fs::Fs;
@@ -419,7 +421,9 @@ impl Settings for ProjectSettings {
                 Self {
                     path: cmd.command,
                     args: cmd.args.unwrap_or_default(),
-                    env: cmd.env,
+                    env: cmd.env.map(|std_map| {
+                        std_map.into_iter().collect::<collections::HashMap<String, String>>()
+                    }),
                 }
             }
         }

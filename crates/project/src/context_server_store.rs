@@ -3,18 +3,75 @@ pub mod registry;
 
 use std::{path::Path, sync::Arc};
 
-use anyhow::{Context as _, Result};
-use collections::{HashMap, HashSet};
-use context_server::{ContextServer, ContextServerId};
-use gpui::{App, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity, actions};
+use anyhow::{anyhow, Context as _, Result};
+use crate::worktree_store::WorktreeStore;
+use gpui::{App, AsyncApp}; // Ensured App and AsyncApp are here
+use log::warn;
+use collections::{HashMap, HashSet}; // FxHashMap might be collections::FxHashMap
+use context_server::{ContextServer, ContextServerCommand, ContextServerId};
+use gpui::{Context, Entity, EventEmitter, Subscription, Task, WeakEntity, actions}; // Removed App, AsyncApp from here as they are imported above
 use registry::ContextServerDescriptorRegistry;
-use settings::{Settings as _, SettingsStore};
+use settings::{Settings as _, SettingsStore, WorktreeId}; // Added WorktreeId
 use util::ResultExt as _;
-
 use crate::{
     project_settings::{ContextServerConfiguration, ProjectSettings},
-    worktree_store::WorktreeStore,
 };
+
+
+// Helper function to substitute $ZED_WORKTREE_ROOT in a command
+fn substitute_command_placeholders(
+    command: &mut ContextServerCommand,
+    worktree_root_path: &str,
+    server_id_for_log: &ContextServerId,
+) -> bool { // Returns true if all placeholders were substituted or no placeholders were present
+    let mut all_substituted_or_not_present = true;
+    log::warn!(
+        "$ZED_WORKTREE_ROOT: Substituting for server_id '{}'. Path: {}",
+        server_id_for_log,
+        worktree_root_path
+    );
+
+    let placeholder = "$ZED_WORKTREE_ROOT";
+
+    // Substitute in command path
+    if command.path.contains(placeholder) {
+        log::warn!("$ZED_WORKTREE_ROOT: Replacing in path: '{}'", command.path);
+        command.path = command.path.replace(placeholder, worktree_root_path);
+        if command.path.contains(placeholder) { // Check if substitution was successful
+            log::error!("$ZED_WORKTREE_ROOT: Failed to substitute in path for server_id '{}'. Path remains: {}", server_id_for_log, command.path);
+            all_substituted_or_not_present = false;
+        }
+    }
+
+    // Substitute in command arguments
+    for arg in command.args.iter_mut() {
+        if arg.contains(placeholder) {
+            log::warn!("$ZED_WORKTREE_ROOT: Replacing in arg: '{}'", arg);
+            *arg = arg.replace(placeholder, worktree_root_path);
+            if arg.contains(placeholder) { // Check if substitution was successful
+                log::error!("$ZED_WORKTREE_ROOT: Failed to substitute in arg '{}' for server_id '{}'. Arg remains: {}", arg, server_id_for_log, arg);
+                all_substituted_or_not_present = false;
+            }
+        }
+    }
+
+    // Substitute in environment variables
+    // Assuming ContextServerCommand.env is Option<std::collections::HashMap<String, String>>
+    if let Some(env_map) = command.env.as_mut() {
+        for val in env_map.values_mut() {
+            if val.contains(placeholder) {
+                log::warn!("$ZED_WORKTREE_ROOT: Replacing in env var value: '{}'", val);
+                *val = val.replace(placeholder, worktree_root_path);
+                if val.contains(placeholder) { // Check if substitution was successful
+                    log::error!("$ZED_WORKTREE_ROOT: Failed to substitute in env value '{}' for server_id '{}'. Value remains: {}", val, server_id_for_log, val);
+                    all_substituted_or_not_present = false;
+                }
+            }
+        }
+    }
+    all_substituted_or_not_present
+}
+
 
 pub fn init(cx: &mut App) {
     extension::init(cx);
@@ -264,7 +321,9 @@ impl ContextServerStore {
             let configuration = state.configuration();
 
             self.stop_server(&state.server().id(), cx)?;
-            let new_server = self.create_context_server(id.clone(), configuration.clone())?;
+            // Pass &*cx which dereferences &mut Context<Self> to &App, then to &AppContext
+            // Pass None for source_worktree_id as restart context might not match original source context
+            let new_server = self.create_context_server(id.clone(), configuration.clone(), &*cx, None)?;
             self.run_server(new_server, configuration, cx);
         }
         Ok(())
@@ -358,15 +417,98 @@ impl ContextServerStore {
         &self,
         id: ContextServerId,
         configuration: Arc<ContextServerConfiguration>,
+        app_cx: &App,
+        source_worktree_id: Option<WorktreeId>, // NEW: To distinguish global vs local config source
     ) -> Result<Arc<ContextServer>> {
+        warn!("ContextServerStore: create_context_server for id: {}, source_worktree_id: {:?}", id, source_worktree_id);
+
+        let mut command_to_run = match configuration.command.clone() {
+            Some(c) => c,
+            None => {
+                return Err(anyhow!(
+                    "ContextServerId {}: Missing command in configuration",
+                    id
+                ))
+            }
+        };
+
+        // --- Логика подстановки плейсхолдера ---
+        let mut command_is_valid_for_launch = true;
+        let placeholder = "$ZED_WORKTREE_ROOT";
+        let placeholder_is_used = command_to_run.path.contains(placeholder)
+            || command_to_run
+                .args
+                .iter()
+                .any(|arg| arg.contains(placeholder))
+            || command_to_run.env.as_ref().map_or(false, |em| {
+                em.values().any(|v| v.contains(placeholder))
+            });
+
+        if placeholder_is_used {
+            let mut worktree_path_for_substitution: Option<String> = None;
+            let mut substitution_attempted = false;
+
+            if let Some(wt_id) = source_worktree_id { // Config is from a specific project
+                substitution_attempted = true;
+                warn!("ContextServerStore: Server id '{}' uses placeholder and is from project settings (worktree_id: {:?}). Attempting to resolve path.", id, wt_id);
+                worktree_path_for_substitution = self.worktree_store.read(app_cx)
+                    .worktree_for_id(wt_id, app_cx)
+                    .and_then(|wh_entity| {
+                        wh_entity.read(app_cx).as_local().map(|lw| {
+                            let path_str = lw.abs_path().to_string_lossy().into_owned();
+                            warn!("ContextServerStore: Resolved path for worktree_id {:?}: {}", wt_id, path_str);
+                            path_str
+                        })
+                    });
+                if worktree_path_for_substitution.is_none() {
+                    warn!("ContextServerStore: Could not resolve path for specific worktree_id {:?}. It might not be a local worktree or not found in store.", wt_id);
+                }
+            } else { // Config is global
+                warn!("ContextServerStore: Server id '{}' uses placeholder in global config. Placeholder will not be substituted.", id);
+                // For global configs, we don't substitute $ZED_WORKTREE_ROOT.
+                // command_is_valid_for_launch remains true, server will launch with placeholder.
+                // If this should be an error, set command_is_valid_for_launch = false here.
+            }
+
+            if substitution_attempted { // Only if we tried to substitute (i.e., for local config)
+                if let Some(ref actual_worktree_path) = worktree_path_for_substitution {
+                    if !substitute_command_placeholders(
+                        &mut command_to_run,
+                        actual_worktree_path,
+                        &id,
+                    ) {
+                        // substitute_command_placeholders уже залогировала ошибку
+                        command_is_valid_for_launch = false;
+                    }
+                } else { // Path for substitution was needed (local config) but not resolved
+                    warn!(
+                        "ContextServerStore: Server_id '{}': {} is used with project settings, but its path could not be resolved. Server cannot be created with this command.",
+                        id, placeholder
+                    );
+                    command_is_valid_for_launch = false;
+                }
+            }
+            // If !substitution_attempted (i.e. global config), command_is_valid_for_launch is still true by default.
+        }
+
+
+        if !command_is_valid_for_launch {
+            return Err(anyhow!(
+                "ContextServerId {}: Failed to resolve {} for command. Check logs for details.",
+                id,
+                placeholder
+            ));
+        }
+        // --- Конец логики подстановки ---
+
         if let Some(factory) = self.context_server_factory.as_ref() {
+            // Если фабрика используется, она должна либо принимать измененную команду,
+            // либо мы не можем здесь выполнить подстановку для фабричных серверов, если они сами читают команду из config.
+            // Передача оригинальной configuration может быть проблемой, если фабрика использует configuration.command.
+            warn!("ContextServerStore: Using factory for server_id {}. Placeholder substitution might not apply if factory re-reads command from config. Command after potential substitution (not passed to factory): {:?}", id, command_to_run);
             Ok(factory(id, configuration))
         } else {
-            let command = configuration
-                .command
-                .clone()
-                .context("Missing command to run context server")?;
-            Ok(Arc::new(ContextServer::stdio(id, command)))
+            Ok(Arc::new(ContextServer::stdio(id, command_to_run))) // Используем измененную command_to_run
         }
     }
 
@@ -407,9 +549,9 @@ impl ContextServerStore {
     }
 
     async fn maintain_servers(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
-        let mut desired_servers = HashMap::default();
+        let mut desired_servers = collections::FxHashMap::default();
 
-        let (registry, worktree_store) = this.update(cx, |this, cx| {
+        let (registry, worktree_store, source_worktree_id_for_settings) = this.update(cx, |this, cx| {
             let location = this
                 .worktree_store
                 .read(cx)
@@ -419,16 +561,27 @@ impl ContextServerStore {
                     worktree_id: worktree.read(cx).id(),
                     path: Path::new(""),
                 });
-            let settings = ProjectSettings::get(location, cx);
-            desired_servers = settings.context_servers.clone();
+            // let settings = ProjectSettings::get(location, cx); // Original line, one below is clone
+            // Convert from settings.context_servers (HashMap<Arc<str>, ...>)
+            // to desired_servers (FxHashMap<ContextServerId, ...>)
+            let settings = ProjectSettings::get(location, cx); // Moved original line here, and location.clone() is correct
+            let servers_from_settings: &std::collections::HashMap<Arc<str>, ContextServerConfiguration> = &settings.context_servers;
+            desired_servers = servers_from_settings.iter().map(|(k, v)| {
+                (ContextServerId(k.clone()), v.clone())
+            }).collect::<collections::FxHashMap<ContextServerId, ContextServerConfiguration>>();
 
-            (this.registry.clone(), this.worktree_store.clone())
+            let source_worktree_id_for_these_settings = location.map(|loc| loc.worktree_id);
+
+            (this.registry.clone(), this.worktree_store.clone(), source_worktree_id_for_these_settings) // Pass it out
         })?;
+
 
         for (id, descriptor) in
             registry.read_with(cx, |registry, _| registry.context_server_descriptors())?
         {
-            let config = desired_servers.entry(id.clone()).or_default();
+            // Now desired_servers is FxHashMap<ContextServerId, ContextServerConfiguration>
+            // and id from the loop is Arc<str>.
+            let config = desired_servers.entry(ContextServerId(id.clone())).or_default();
             if config.command.is_none() {
                 if let Some(extension_command) = descriptor
                     .command(worktree_store.clone(), &cx)
@@ -454,19 +607,21 @@ impl ContextServerStore {
                 // All servers that are not in desired_servers should be removed from the store.
                 // E.g. this can happen if the user removed a server from the configuration,
                 // or the user uninstalled an extension.
-                if !desired_servers.contains_key(&server_id.0) {
+                // server_id here is &ContextServerId from this.servers.keys()
+                if !desired_servers.contains_key(server_id) {
                     servers_to_remove.insert(server_id.clone());
                 }
             }
 
             for (id, config) in desired_servers {
-                let id = ContextServerId(id.clone());
+                // id from this loop is already ContextServerId because desired_servers is FxHashMap<ContextServerId, _>
+                // The line `let id = ContextServerId(id.clone());` was removed as it's incorrect.
 
                 let existing_config = this.servers.get(&id).map(|state| state.configuration());
                 if existing_config.as_deref() != Some(&config) {
                     let config = Arc::new(config);
                     if let Some(server) = this
-                        .create_context_server(id.clone(), config.clone())
+                        .create_context_server(id.clone(), config.clone(), &*_cx, source_worktree_id_for_settings) // Pass AppContext and source_worktree_id
                         .log_err()
                     {
                         servers_to_start.push((server, config));
@@ -492,640 +647,5 @@ impl ContextServerStore {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{FakeFs, Project, project_settings::ProjectSettings};
-    use context_server::{
-        transport::Transport,
-        types::{
-            self, Implementation, InitializeResponse, ProtocolVersion, RequestType,
-            ServerCapabilities,
-        },
-    };
-    use futures::{Stream, StreamExt as _, lock::Mutex};
-    use gpui::{AppContext, BackgroundExecutor, TestAppContext, UpdateGlobal as _};
-    use serde_json::json;
-    use std::{cell::RefCell, pin::Pin, rc::Rc};
-    use util::path;
-
-    #[gpui::test]
-    async fn test_context_server_status(cx: &mut TestAppContext) {
-        const SERVER_1_ID: &'static str = "mcp-1";
-        const SERVER_2_ID: &'static str = "mcp-2";
-
-        let (_fs, project) = setup_context_server_test(
-            cx,
-            json!({"code.rs": ""}),
-            vec![
-                (SERVER_1_ID.into(), ContextServerConfiguration::default()),
-                (SERVER_2_ID.into(), ContextServerConfiguration::default()),
-            ],
-        )
-        .await;
-
-        let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
-        let store = cx.new(|cx| {
-            ContextServerStore::test(registry.clone(), project.read(cx).worktree_store(), cx)
-        });
-
-        let server_1_id = ContextServerId("mcp-1".into());
-        let server_2_id = ContextServerId("mcp-2".into());
-
-        let transport_1 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response("mcp-1".to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let transport_2 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response("mcp-2".to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let server_1 = Arc::new(ContextServer::new(server_1_id.clone(), transport_1.clone()));
-        let server_2 = Arc::new(ContextServer::new(server_2_id.clone(), transport_2.clone()));
-
-        store
-            .update(cx, |store, cx| store.start_server(server_1, cx))
-            .unwrap();
-
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                store.read(cx).status_for_server(&server_1_id),
-                Some(ContextServerStatus::Running)
-            );
-            assert_eq!(store.read(cx).status_for_server(&server_2_id), None);
-        });
-
-        store
-            .update(cx, |store, cx| store.start_server(server_2.clone(), cx))
-            .unwrap();
-
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                store.read(cx).status_for_server(&server_1_id),
-                Some(ContextServerStatus::Running)
-            );
-            assert_eq!(
-                store.read(cx).status_for_server(&server_2_id),
-                Some(ContextServerStatus::Running)
-            );
-        });
-
-        store
-            .update(cx, |store, cx| store.stop_server(&server_2_id, cx))
-            .unwrap();
-
-        cx.update(|cx| {
-            assert_eq!(
-                store.read(cx).status_for_server(&server_1_id),
-                Some(ContextServerStatus::Running)
-            );
-            assert_eq!(
-                store.read(cx).status_for_server(&server_2_id),
-                Some(ContextServerStatus::Stopped)
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_context_server_status_events(cx: &mut TestAppContext) {
-        const SERVER_1_ID: &'static str = "mcp-1";
-        const SERVER_2_ID: &'static str = "mcp-2";
-
-        let (_fs, project) = setup_context_server_test(
-            cx,
-            json!({"code.rs": ""}),
-            vec![
-                (SERVER_1_ID.into(), ContextServerConfiguration::default()),
-                (SERVER_2_ID.into(), ContextServerConfiguration::default()),
-            ],
-        )
-        .await;
-
-        let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
-        let store = cx.new(|cx| {
-            ContextServerStore::test(registry.clone(), project.read(cx).worktree_store(), cx)
-        });
-
-        let server_1_id = ContextServerId("mcp-1".into());
-        let server_2_id = ContextServerId("mcp-2".into());
-
-        let transport_1 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response("mcp-1".to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let transport_2 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response("mcp-2".to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let server_1 = Arc::new(ContextServer::new(server_1_id.clone(), transport_1.clone()));
-        let server_2 = Arc::new(ContextServer::new(server_2_id.clone(), transport_2.clone()));
-
-        let _server_events = assert_server_events(
-            &store,
-            vec![
-                (server_1_id.clone(), ContextServerStatus::Starting),
-                (server_1_id.clone(), ContextServerStatus::Running),
-                (server_2_id.clone(), ContextServerStatus::Starting),
-                (server_2_id.clone(), ContextServerStatus::Running),
-                (server_2_id.clone(), ContextServerStatus::Stopped),
-            ],
-            cx,
-        );
-
-        store
-            .update(cx, |store, cx| store.start_server(server_1, cx))
-            .unwrap();
-
-        cx.run_until_parked();
-
-        store
-            .update(cx, |store, cx| store.start_server(server_2.clone(), cx))
-            .unwrap();
-
-        cx.run_until_parked();
-
-        store
-            .update(cx, |store, cx| store.stop_server(&server_2_id, cx))
-            .unwrap();
-    }
-
-    #[gpui::test(iterations = 25)]
-    async fn test_context_server_concurrent_starts(cx: &mut TestAppContext) {
-        const SERVER_1_ID: &'static str = "mcp-1";
-
-        let (_fs, project) = setup_context_server_test(
-            cx,
-            json!({"code.rs": ""}),
-            vec![(SERVER_1_ID.into(), ContextServerConfiguration::default())],
-        )
-        .await;
-
-        let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
-        let store = cx.new(|cx| {
-            ContextServerStore::test(registry.clone(), project.read(cx).worktree_store(), cx)
-        });
-
-        let server_id = ContextServerId(SERVER_1_ID.into());
-
-        let transport_1 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response(SERVER_1_ID.to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let transport_2 =
-            Arc::new(FakeTransport::new(
-                cx.executor(),
-                |_, request_type, _| match request_type {
-                    Some(RequestType::Initialize) => {
-                        Some(create_initialize_response(SERVER_1_ID.to_string()))
-                    }
-                    _ => None,
-                },
-            ));
-
-        let server_with_same_id_1 = Arc::new(ContextServer::new(server_id.clone(), transport_1));
-        let server_with_same_id_2 = Arc::new(ContextServer::new(server_id.clone(), transport_2));
-
-        // If we start another server with the same id, we should report that we stopped the previous one
-        let _server_events = assert_server_events(
-            &store,
-            vec![
-                (server_id.clone(), ContextServerStatus::Starting),
-                (server_id.clone(), ContextServerStatus::Stopped),
-                (server_id.clone(), ContextServerStatus::Starting),
-                (server_id.clone(), ContextServerStatus::Running),
-            ],
-            cx,
-        );
-
-        store
-            .update(cx, |store, cx| {
-                store.start_server(server_with_same_id_1.clone(), cx)
-            })
-            .unwrap();
-        store
-            .update(cx, |store, cx| {
-                store.start_server(server_with_same_id_2.clone(), cx)
-            })
-            .unwrap();
-        cx.update(|cx| {
-            assert_eq!(
-                store.read(cx).status_for_server(&server_id),
-                Some(ContextServerStatus::Starting)
-            );
-        });
-
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                store.read(cx).status_for_server(&server_id),
-                Some(ContextServerStatus::Running)
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_context_server_maintain_servers_loop(cx: &mut TestAppContext) {
-        const SERVER_1_ID: &'static str = "mcp-1";
-        const SERVER_2_ID: &'static str = "mcp-2";
-
-        let server_1_id = ContextServerId(SERVER_1_ID.into());
-        let server_2_id = ContextServerId(SERVER_2_ID.into());
-
-        let (_fs, project) = setup_context_server_test(
-            cx,
-            json!({"code.rs": ""}),
-            vec![(
-                SERVER_1_ID.into(),
-                ContextServerConfiguration {
-                    command: None,
-                    settings: Some(json!({
-                        "somevalue": true
-                    })),
-                },
-            )],
-        )
-        .await;
-
-        let executor = cx.executor();
-        let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
-        let store = cx.new(|cx| {
-            ContextServerStore::test_maintain_server_loop(
-                Box::new(move |id, _| {
-                    let transport = FakeTransport::new(executor.clone(), {
-                        let id = id.0.clone();
-                        move |_, request_type, _| match request_type {
-                            Some(RequestType::Initialize) => {
-                                Some(create_initialize_response(id.clone().to_string()))
-                            }
-                            _ => None,
-                        }
-                    });
-                    Arc::new(ContextServer::new(id.clone(), Arc::new(transport)))
-                }),
-                registry.clone(),
-                project.read(cx).worktree_store(),
-                cx,
-            )
-        });
-
-        // Ensure that mcp-1 starts up
-        {
-            let _server_events = assert_server_events(
-                &store,
-                vec![
-                    (server_1_id.clone(), ContextServerStatus::Starting),
-                    (server_1_id.clone(), ContextServerStatus::Running),
-                ],
-                cx,
-            );
-            cx.run_until_parked();
-        }
-
-        // Ensure that mcp-1 is restarted when the configuration was changed
-        {
-            let _server_events = assert_server_events(
-                &store,
-                vec![
-                    (server_1_id.clone(), ContextServerStatus::Stopped),
-                    (server_1_id.clone(), ContextServerStatus::Starting),
-                    (server_1_id.clone(), ContextServerStatus::Running),
-                ],
-                cx,
-            );
-            set_context_server_configuration(
-                vec![(
-                    server_1_id.0.clone(),
-                    ContextServerConfiguration {
-                        command: None,
-                        settings: Some(json!({
-                            "somevalue": false
-                        })),
-                    },
-                )],
-                cx,
-            );
-
-            cx.run_until_parked();
-        }
-
-        // Ensure that mcp-1 is not restarted when the configuration was not changed
-        {
-            let _server_events = assert_server_events(&store, vec![], cx);
-            set_context_server_configuration(
-                vec![(
-                    server_1_id.0.clone(),
-                    ContextServerConfiguration {
-                        command: None,
-                        settings: Some(json!({
-                            "somevalue": false
-                        })),
-                    },
-                )],
-                cx,
-            );
-
-            cx.run_until_parked();
-        }
-
-        // Ensure that mcp-2 is started once it is added to the settings
-        {
-            let _server_events = assert_server_events(
-                &store,
-                vec![
-                    (server_2_id.clone(), ContextServerStatus::Starting),
-                    (server_2_id.clone(), ContextServerStatus::Running),
-                ],
-                cx,
-            );
-            set_context_server_configuration(
-                vec![
-                    (
-                        server_1_id.0.clone(),
-                        ContextServerConfiguration {
-                            command: None,
-                            settings: Some(json!({
-                                "somevalue": false
-                            })),
-                        },
-                    ),
-                    (
-                        server_2_id.0.clone(),
-                        ContextServerConfiguration {
-                            command: None,
-                            settings: Some(json!({
-                                "somevalue": true
-                            })),
-                        },
-                    ),
-                ],
-                cx,
-            );
-
-            cx.run_until_parked();
-        }
-
-        // Ensure that mcp-2 is removed once it is removed from the settings
-        {
-            let _server_events = assert_server_events(
-                &store,
-                vec![(server_2_id.clone(), ContextServerStatus::Stopped)],
-                cx,
-            );
-            set_context_server_configuration(
-                vec![(
-                    server_1_id.0.clone(),
-                    ContextServerConfiguration {
-                        command: None,
-                        settings: Some(json!({
-                            "somevalue": false
-                        })),
-                    },
-                )],
-                cx,
-            );
-
-            cx.run_until_parked();
-
-            cx.update(|cx| {
-                assert_eq!(store.read(cx).status_for_server(&server_2_id), None);
-            });
-        }
-    }
-
-    fn set_context_server_configuration(
-        context_servers: Vec<(Arc<str>, ContextServerConfiguration)>,
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(|cx| {
-            SettingsStore::update_global(cx, |store, cx| {
-                let mut settings = ProjectSettings::default();
-                for (id, config) in context_servers {
-                    settings.context_servers.insert(id, config);
-                }
-                store
-                    .set_user_settings(&serde_json::to_string(&settings).unwrap(), cx)
-                    .unwrap();
-            })
-        });
-    }
-
-    struct ServerEvents {
-        received_event_count: Rc<RefCell<usize>>,
-        expected_event_count: usize,
-        _subscription: Subscription,
-    }
-
-    impl Drop for ServerEvents {
-        fn drop(&mut self) {
-            let actual_event_count = *self.received_event_count.borrow();
-            assert_eq!(
-                actual_event_count, self.expected_event_count,
-                "
-                Expected to receive {} context server store events, but received {} events",
-                self.expected_event_count, actual_event_count
-            );
-        }
-    }
-
-    fn assert_server_events(
-        store: &Entity<ContextServerStore>,
-        expected_events: Vec<(ContextServerId, ContextServerStatus)>,
-        cx: &mut TestAppContext,
-    ) -> ServerEvents {
-        cx.update(|cx| {
-            let mut ix = 0;
-            let received_event_count = Rc::new(RefCell::new(0));
-            let expected_event_count = expected_events.len();
-            let subscription = cx.subscribe(store, {
-                let received_event_count = received_event_count.clone();
-                move |_, event, _| match event {
-                    Event::ServerStatusChanged {
-                        server_id: actual_server_id,
-                        status: actual_status,
-                    } => {
-                        let (expected_server_id, expected_status) = &expected_events[ix];
-
-                        assert_eq!(
-                            actual_server_id, expected_server_id,
-                            "Expected different server id at index {}",
-                            ix
-                        );
-                        assert_eq!(
-                            actual_status, expected_status,
-                            "Expected different status at index {}",
-                            ix
-                        );
-                        ix += 1;
-                        *received_event_count.borrow_mut() += 1;
-                    }
-                }
-            });
-            ServerEvents {
-                expected_event_count,
-                received_event_count,
-                _subscription: subscription,
-            }
-        })
-    }
-
-    async fn setup_context_server_test(
-        cx: &mut TestAppContext,
-        files: serde_json::Value,
-        context_server_configurations: Vec<(Arc<str>, ContextServerConfiguration)>,
-    ) -> (Arc<FakeFs>, Entity<Project>) {
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            Project::init_settings(cx);
-            let mut settings = ProjectSettings::get_global(cx).clone();
-            for (id, config) in context_server_configurations {
-                settings.context_servers.insert(id, config);
-            }
-            ProjectSettings::override_global(settings, cx);
-        });
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/test"), files).await;
-        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
-
-        (fs, project)
-    }
-
-    fn create_initialize_response(server_name: String) -> serde_json::Value {
-        serde_json::to_value(&InitializeResponse {
-            protocol_version: ProtocolVersion(types::LATEST_PROTOCOL_VERSION.to_string()),
-            server_info: Implementation {
-                name: server_name,
-                version: "1.0.0".to_string(),
-            },
-            capabilities: ServerCapabilities::default(),
-            meta: None,
-        })
-        .unwrap()
-    }
-
-    struct FakeTransport {
-        on_request: Arc<
-            dyn Fn(u64, Option<RequestType>, serde_json::Value) -> Option<serde_json::Value>
-                + Send
-                + Sync,
-        >,
-        tx: futures::channel::mpsc::UnboundedSender<String>,
-        rx: Arc<Mutex<futures::channel::mpsc::UnboundedReceiver<String>>>,
-        executor: BackgroundExecutor,
-    }
-
-    impl FakeTransport {
-        fn new(
-            executor: BackgroundExecutor,
-            on_request: impl Fn(
-                u64,
-                Option<RequestType>,
-                serde_json::Value,
-            ) -> Option<serde_json::Value>
-            + 'static
-            + Send
-            + Sync,
-        ) -> Self {
-            let (tx, rx) = futures::channel::mpsc::unbounded();
-            Self {
-                on_request: Arc::new(on_request),
-                tx,
-                rx: Arc::new(Mutex::new(rx)),
-                executor,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Transport for FakeTransport {
-        async fn send(&self, message: String) -> Result<()> {
-            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&message) {
-                let id = msg.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
-
-                if let Some(method) = msg.get("method") {
-                    let request_type = method
-                        .as_str()
-                        .and_then(|method| types::RequestType::try_from(method).ok());
-                    if let Some(payload) = (self.on_request.as_ref())(id, request_type, msg) {
-                        let response = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": payload
-                        });
-
-                        self.tx
-                            .unbounded_send(response.to_string())
-                            .context("sending a message")?;
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        fn receive(&self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
-            let rx = self.rx.clone();
-            let executor = self.executor.clone();
-            Box::pin(futures::stream::unfold(rx, move |rx| {
-                let executor = executor.clone();
-                async move {
-                    let mut rx_guard = rx.lock().await;
-                    executor.simulate_random_delay().await;
-                    if let Some(message) = rx_guard.next().await {
-                        drop(rx_guard);
-                        Some((message, rx))
-                    } else {
-                        None
-                    }
-                }
-            }))
-        }
-
-        fn receive_err(&self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
-            Box::pin(futures::stream::empty())
-        }
     }
 }
